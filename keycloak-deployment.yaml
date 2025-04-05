@@ -1,0 +1,237 @@
+---
+# 1. ConfigMap pour Patroni
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: patroni-config
+  namespace: default
+data:
+  patroni.yaml: |
+    scope: keycloak-cluster
+    namespace: /service/
+    name: ${POD_NAME}
+    restapi:
+      listen: 0.0.0.0:8008
+      connect_address: ${POD_IP}:8008
+    postgresql:
+      listen: 0.0.0.0:5432
+      connect_address: ${POD_IP}:5432
+      data_dir: /var/lib/postgresql/data
+      pg_hba:
+        - host all all 0.0.0.0/0 md5
+      parameters:
+        max_connections: 100
+        shared_buffers: 256MB
+        work_mem: 4MB
+        maintenance_work_mem: 64MB
+    bootstrap:
+      dcs:
+        loop_wait: 10
+        ttl: 30
+        retry_timeout: 10
+        maximum_lag_on_failover: 1048576
+      initdb:
+        - encoding: UTF8
+        - data-checksums
+      post_init: /scripts/create_keycloak_db.sh
+      users:
+        keycloak:
+          password: "keycloak"
+          options:
+            - CREATEDB
+            - CREATEROLE
+            - LOGIN
+    tags:
+      nofailover: false
+      noloadbalance: false
+---
+# 2. Secret pour la connexion à PostgreSQL
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-db-secret
+  namespace: default
+type: Opaque
+stringData:
+  password: "keycloak"
+---
+# 3. StatefulSet PostgreSQL HA avec Patroni
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak-db
+  namespace: default
+spec:
+  serviceName: "keycloak-db"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-db
+  template:
+    metadata:
+      labels:
+        app: keycloak-db
+    spec:
+      serviceAccountName: patroni-sa
+      containers:
+      - name: postgres
+        image: registry.opensource.zalan.do/acid/spilo-15:latest
+        ports:
+        - containerPort: 5432
+        - containerPort: 8008
+        env:
+        - name: PATRONI_CONFIG
+          valueFrom:
+            configMapKeyRef:
+              name: patroni-config
+              key: patroni.yaml
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-db-secret
+              key: password
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: keycloak-db-pvc
+---
+# 4. PersistentVolumeClaims (DB + Themes)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-db-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-themes-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
+---
+# 5. Service Headless pour Patroni
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-db
+  namespace: default
+spec:
+  selector:
+    app: keycloak-db
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+  clusterIP: None
+---
+# 6. ServiceAccount pour Patroni (Évite les erreurs 403)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: patroni-sa
+  namespace: default
+---
+# 7. ClusterRoleBinding pour Patroni (Permet le patch des Pods)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: patroni-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: patroni-sa
+  namespace: default
+---
+# 8. Déploiement de Keycloak HA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: default
+  labels:
+    app: keycloak
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:latest
+        command: ["/opt/keycloak/bin/kc.sh"]
+        args: ["start"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: KEYCLOAK_ADMIN
+          value: "admin"
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          value: "admin"
+        - name: KC_HOSTNAME_STRICT
+          value: "false"
+        - name: KC_HOSTNAME_STRICT_HTTPS
+          value: "false"
+        - name: KC_DB
+          value: "postgres"
+        - name: KC_DB_URL
+          value: "jdbc:postgresql://keycloak-db.default.svc.cluster.local:5432/keycloak"
+        - name: KC_DB_USERNAME
+          value: "keycloak"
+        - name: KC_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: keycloak-db-secret
+              key: password
+        - name: KC_HOSTNAME
+          value: "keycloak.mondomaine.fr"
+        - name: KC_HTTPS_KEY_STORE
+          value: "false"  # Si tu ne veux pas activer HTTPS
+        - name: KC_HTTP_ENABLED
+          value: "true"   # Pour forcer HTTP et désactiver HTTPS
+        - name: PROXY_ADDRESS_FORWARDING
+          value: "true"
+        # Configurations liées au cache Infinispan pour la gestion des sessions
+        - name: KEYCLOAK_CACHE
+          value: "infinispan"  # Active Infinispan comme cache
+        - name: KEYCLOAK_CACHE_MODE
+          value: "distributed" # Mode distribué
+        - name: KEYCLOAK_CACHE_CLUSTER
+          value: "keycloak-cluster"  # Nom du cluster Infinispan
+        # Autres variables si nécessaire
+        volumeMounts:
+        - name: themes-volume
+          mountPath: /opt/keycloak/themes
+      volumes:
+      - name: themes-volume
+        persistentVolumeClaim:
+          claimName: keycloak-themes-pvc
